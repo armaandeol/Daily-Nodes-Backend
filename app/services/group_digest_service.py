@@ -1,0 +1,185 @@
+from datetime import date, timedelta, datetime
+from groq import AsyncGroq
+from app.config import settings
+from app.services.supabase_client import get_supabase
+from collections import Counter
+
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+
+GROUP_WEEKLY_PROMPT = """You are writing a warm end-of-week group summary for a life-logging app called Daily Nodes.
+
+Group name: {group_name}
+Week: {date_start} to {date_end}
+Members: {member_names}
+
+--- All shared nodes this week ---
+{all_nodes}
+
+Write a short, warm group summary in 4-5 sentences. Cover:
+- What the group was collectively up to
+- Any standout moments or themes
+- One observation about the group's energy this week
+
+Tone: like a friend summarising the group chat. Warm, light, no bullet points, prose only.
+Do not mention statistics — those are shown separately."""
+
+
+def _compute_stats(nodes: list, members: list, streaks: list) -> dict:
+    if not nodes:
+        return {}
+
+    from collections import Counter
+    from datetime import datetime
+
+    # Most active day
+    day_counts = Counter()
+    type_counts = Counter()
+    member_counts = Counter()
+
+    for n in nodes:
+        dt = datetime.fromisoformat(n["logged_at"].replace("Z", "+00:00"))
+        day_counts[dt.strftime("%A")] += 1
+        type_counts[n.get("type", "custom")] += 1
+        member_counts[n.get("clerk_user_id", "")] += 1
+
+    # Resolve most active member name
+    most_active_id = member_counts.most_common(1)[0][0] if member_counts else None
+    most_active_name = next(
+        (m["profiles"]["display_name"] for m in members if m["clerk_user_id"] == most_active_id),
+        None
+    )
+
+    # Streak info per member
+    member_streak_list = []
+    for s in streaks:
+        name = next(
+            (m["profiles"]["display_name"] for m in members if m["clerk_user_id"] == s["clerk_user_id"]),
+            "Unknown"
+        )
+        member_streak_list.append({
+            "name": name,
+            "streak": s["streak_count"],
+            "best": s["best_streak"],
+        })
+
+    return {
+        "total_nodes": len(nodes),
+        "most_active_day": day_counts.most_common(1)[0][0] if day_counts else None,
+        "most_active_member": most_active_name,
+        "member_streaks": sorted(member_streak_list, key=lambda x: x["streak"], reverse=True),
+        "node_type_breakdown": dict(type_counts),
+    }
+
+
+async def generate_group_weekly_digest(group_id: str) -> dict:
+    sb = get_supabase()
+    today = date.today()
+    date_end = today
+    date_start = today - timedelta(days=6)
+
+    # Idempotency check
+    existing = (
+        sb.table("digests")
+        .select("id, status")
+        .eq("group_id", group_id)
+        .eq("period", "group_weekly")
+        .eq("date_start", date_start.isoformat())
+        .execute()
+    )
+    if existing.data and existing.data[0]["status"] == "generated":
+        return existing.data[0]
+
+    # Fetch group info
+    group = sb.table("groups").select("name").eq("id", group_id).single().execute()
+    group_name = group.data["name"] if group.data else "Your group"
+
+    # Fetch members
+    members = (
+        sb.table("group_members")
+        .select("clerk_user_id, profiles(display_name)")
+        .eq("group_id", group_id)
+        .execute()
+    ).data or []
+
+    member_ids = [m["clerk_user_id"] for m in members]
+    member_names = ", ".join(m["profiles"]["display_name"] for m in members)
+
+    # Fetch all shared nodes from the group this week
+    nodes = (
+        sb.table("nodes")
+        .select("logged_at, type, title, content, clerk_user_id, profiles(display_name)")
+        .eq("group_id", group_id)
+        .eq("visibility", "shared")
+        .gte("logged_at", date_start.isoformat())
+        .lte("logged_at", date_end.isoformat() + "T23:59:59")
+        .order("logged_at")
+        .execute()
+    ).data or []
+
+    # Fetch streaks for all members
+    streaks = (
+        sb.table("streaks")
+        .select("clerk_user_id, streak_count, best_streak")
+        .in_("clerk_user_id", member_ids)
+        .execute()
+    ).data or []
+
+    # Compute stats
+    stats = _compute_stats(nodes, members, streaks)
+
+    # Format nodes for prompt
+    node_lines = []
+    for n in nodes:
+        name = n.get("profiles", {}).get("display_name", "Someone")
+        time_str = n.get("logged_at", "")[:10]
+        parts = [time_str, name, n.get("type", ""), n.get("title") or "", n.get("content") or ""]
+        node_lines.append(" | ".join(p for p in parts if p))
+    nodes_text = "\n".join(node_lines) if node_lines else "(no shared activity this week)"
+
+    prompt = GROUP_WEEKLY_PROMPT.format(
+        group_name=group_name,
+        date_start=date_start.strftime("%d %b"),
+        date_end=date_end.strftime("%d %b %Y"),
+        member_names=member_names,
+        all_nodes=nodes_text,
+    )
+
+    # Insert pending record — group_weekly has no clerk_user_id
+    # Use the group creator's id as a placeholder for the FK
+    # Actually store with clerk_user_id = null workaround:
+    # We store group_id and use a sentinel clerk_user_id = 'group:{group_id}'
+    sentinel_uid = f"group:{group_id}"
+
+    pending = sb.table("digests").upsert({
+        "clerk_user_id": sentinel_uid,
+        "group_id": group_id,
+        "period": "group_weekly",
+        "date_start": date_start.isoformat(),
+        "date_end": date_end.isoformat(),
+        "status": "pending",
+        "suggestions": stats,
+    }, on_conflict="clerk_user_id,period,date_start").execute()
+
+    digest_id = pending.data[0]["id"]
+
+    try:
+        response = await groq_client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            temperature=0.7,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        content = response.choices[0].message.content
+
+        result = sb.table("digests").update({
+            "content": content,
+            "status": "generated",
+            "suggestions": stats,
+            "generated_at": datetime.utcnow().isoformat(),
+        }).eq("id", digest_id).execute()
+
+        return result.data[0]
+
+    except Exception as e:
+        sb.table("digests").update({"status": "failed"}).eq("id", digest_id).execute()
+        raise RuntimeError(f"Group digest generation failed: {e}")
