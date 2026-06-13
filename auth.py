@@ -30,6 +30,7 @@ class ClerkAuthMiddleware(BaseHTTPMiddleware):
                 signing_key.key,
                 algorithms=["RS256"],
                 options={"verify_aud": False},  # Clerk doesn't set aud by default
+                leeway=60,
             )
         except jwt.ExpiredSignatureError:
             return JSONResponse({"detail": "Token expired"}, status_code=401)

@@ -192,8 +192,28 @@ async def create_node(
     sb = get_supabase()
     image_url = None
 
+    is_image_uploaded = False
+    if image and image.filename:
+        is_image_uploaded = True
+
+    # Validation:
+    # 1. Image nodes cannot have a title (text should go in description/content instead).
+    # 2. Text-only nodes must have a title.
+    if is_image_uploaded:
+        if title and title.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Nodes with images cannot have a title. Please put any text in the description instead."
+            )
+    else:
+        if not title or not title.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Title is required for text-only nodes."
+            )
+
     # Upload image if provided
-    if image:
+    if is_image_uploaded:
         ext = mimetypes.guess_extension(image.content_type) or ".jpg"
         storage_path = f"{uid}/{uuid.uuid4()}{ext}"
         data = await image.read()
