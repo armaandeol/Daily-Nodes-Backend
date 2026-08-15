@@ -9,13 +9,16 @@ from app.config import settings
 _jwks_client = PyJWKClient(settings.CLERK_JWKS_URL)
 
 EXCLUDED_PATHS = {"/health", "/webhooks/clerk", "/docs", "/openapi.json"}
+# /internal/cron/* authenticates itself via X-Cron-Secret (see app/routers/cron.py)
+EXCLUDED_PREFIXES = ("/internal/cron/",)
 
 
 class ClerkAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in EXCLUDED_PATHS:
+        if request.url.path in EXCLUDED_PATHS or request.url.path.startswith(EXCLUDED_PREFIXES):
             return await call_next(request)
 
+        # Regular Clerk authentication
         auth_header = request.headers.get("Authorization")
         if not auth_header or not auth_header.startswith("Bearer "):
             return JSONResponse(

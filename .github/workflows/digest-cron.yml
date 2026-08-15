@@ -1,0 +1,37 @@
+name: Digest cron
+
+# Pings the deployed backend hourly (and once weekly for the group digest).
+# The ping wakes a sleeping free-tier instance and triggers the same check
+# the in-process scheduler runs on its own — safe to overlap, both go
+# through the same DB-backed distributed lock.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   BACKEND_URL   e.g. https://your-app.onrender.com
+#   CRON_SECRET   must match the CRON_SECRET env var set on the backend
+
+on:
+  schedule:
+    - cron: "0 * * * *"      # every hour, on the hour (UTC)
+    - cron: "0 20 * * 0"     # Sundays at 20:00 UTC, for the weekly group digest
+  workflow_dispatch: {}      # lets you trigger a run manually from the Actions tab
+
+jobs:
+  ping-daily:
+    if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger daily digest check
+        run: |
+          curl --fail --show-error --max-time 90 \
+            -X POST "${{ secrets.BACKEND_URL }}/internal/cron/daily-digests" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"
+
+  ping-weekly:
+    if: github.event.schedule == '0 20 * * 0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger weekly group digest check
+        run: |
+          curl --fail --show-error --max-time 90 \
+            -X POST "${{ secrets.BACKEND_URL }}/internal/cron/weekly-group-digests" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"

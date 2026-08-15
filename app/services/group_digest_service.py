@@ -1,10 +1,11 @@
 from datetime import date, timedelta, datetime
-from groq import AsyncGroq
+from google import genai
 from app.config import settings
 from app.services.supabase_client import get_supabase
+from app.services.digest_service import _claim_digest_slot
 from collections import Counter
 
-groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 GROUP_WEEKLY_PROMPT = """
 You are the editorial voice of Roz — a premium life-logging app (Roz means "daily" in Punjabi). \
@@ -90,17 +91,24 @@ async def generate_group_weekly_digest(group_id: str) -> dict:
     date_end = today
     date_start = today - timedelta(days=6)
 
-    # Idempotency check
-    existing = (
-        sb.table("digests")
-        .select("id, status")
-        .eq("group_id", group_id)
-        .eq("period", "group_weekly")
-        .eq("date_start", date_start.isoformat())
-        .execute()
+    # group_weekly digests have no natural clerk_user_id — use a sentinel
+    # derived from group_id so the table's unique constraint can still
+    # serve as our idempotency + distributed-lock key.
+    sentinel_uid = f"group:{group_id}"
+
+    claim_status, claim_row = _claim_digest_slot(
+        sb,
+        {
+            "clerk_user_id": sentinel_uid,
+            "period": "group_weekly",
+            "date_start": date_start.isoformat(),
+            "date_end": date_end.isoformat(),
+        },
+        extra={"group_id": group_id},
     )
-    if existing.data and existing.data[0]["status"] == "generated":
-        return existing.data[0]
+    if claim_status == "skip":
+        return claim_row or {"status": "skipped", "reason": "Already handled by another worker."}
+    digest_id = claim_row["id"]
 
     # Fetch group info
     group = sb.table("groups").select("name").eq("id", group_id).single().execute()
@@ -157,32 +165,14 @@ async def generate_group_weekly_digest(group_id: str) -> dict:
         all_nodes=nodes_text,
     )
 
-    # Insert pending record — group_weekly has no clerk_user_id
-    # Use the group creator's id as a placeholder for the FK
-    # Actually store with clerk_user_id = null workaround:
-    # We store group_id and use a sentinel clerk_user_id = 'group:{group_id}'
-    sentinel_uid = f"group:{group_id}"
-
-    pending = sb.table("digests").upsert({
-        "clerk_user_id": sentinel_uid,
-        "group_id": group_id,
-        "period": "group_weekly",
-        "date_start": date_start.isoformat(),
-        "date_end": date_end.isoformat(),
-        "status": "pending",
-        "suggestions": stats,
-    }, on_conflict="clerk_user_id,period,date_start").execute()
-
-    digest_id = pending.data[0]["id"]
-
     try:
-        response = await groq_client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            temperature=0.7,
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}],
+        response = await gemini_client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            # See digest_service.py — thinking tokens share this budget, so keep it generous.
+            config={"temperature": 0.7, "max_output_tokens": 2000},
         )
-        content = response.choices[0].message.content
+        content = response.text
 
         result = sb.table("digests").update({
             "content": content,

@@ -14,6 +14,7 @@ class ProfileUpdate(BaseModel):
     username: Optional[str] = None
     bio: Optional[str] = None
     digest_slot: Optional[str] = None
+    digest_enabled: Optional[bool] = None  # opt out of the daily digest entirely
 
     @field_validator("digest_slot")
     @classmethod

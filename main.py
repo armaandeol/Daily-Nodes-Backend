@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.middleware.auth import ClerkAuthMiddleware
-from app.routers import webhooks
+from app.routers import webhooks, cron
 from nodes import router as nodes_router
 from groups import router as groups_router
 from profiles import router as profiles_router
+from digests import router as digests_router
 from contextlib import asynccontextmanager
 from app.services.scheduler import start_scheduler, stop_scheduler
 
@@ -30,9 +31,11 @@ app.add_middleware(ClerkAuthMiddleware)
 
 # ── Routers ───────────────────────────────────────────────────────────────
 app.include_router(webhooks.router, tags=["webhooks"])
+app.include_router(cron.router, prefix="/internal/cron", tags=["cron"])
 app.include_router(nodes_router, prefix="/nodes", tags=["nodes"])
 app.include_router(groups_router, prefix="/api/v1/groups", tags=["groups"])
 app.include_router(profiles_router, prefix="/api/v1/profiles", tags=["profiles"])
+app.include_router(digests_router, prefix="/api/v1/digests", tags=["digests"])
 
 
 

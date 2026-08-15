@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: daily-nodes-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: CLERK_WEBHOOK_SECRET
+        sync: false
+      - key: CLERK_JWKS_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
+      - key: FRONTEND_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false

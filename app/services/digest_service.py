@@ -1,9 +1,85 @@
-from datetime import date, timedelta, datetime
-from groq import AsyncGroq
+from datetime import date, timedelta, datetime, timezone
+from typing import Optional
+from google import genai
 from app.config import settings
 from app.services.supabase_client import get_supabase
+import logging
 
-groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
+gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
+
+# A claimed-but-never-finished row (worker crashed mid-generation) is
+# reclaimable after this long — long enough to outlast a slow Gemini call.
+CLAIM_STALE_AFTER = timedelta(minutes=15)
+
+
+def _claim_digest_slot(sb, match: dict, extra: Optional[dict] = None) -> tuple[str, Optional[dict]]:
+    """
+    Atomically claim a digest row for processing, using the table's unique
+    constraint on `match` (e.g. clerk_user_id + period + date_start, or
+    group_id + period + date_start for group digests) as a distributed
+    lock — this is what keeps multiple app instances from generating the
+    same digest twice.
+
+    `match` must contain only the columns covered by the unique constraint
+    (used both for the insert and to re-select the row on conflict).
+    `extra` holds any additional columns to set on first insert only
+    (e.g. group_id, suggestions) — never used as a lookup filter, since
+    jsonb columns don't match reliably with equality filters.
+
+    Returns ("claimed", row) if the caller should proceed to generate.
+    Returns ("skip", row_or_None) if another worker already handled (or is
+    actively handling) this slot.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Fast path: nobody has touched this slot yet — the INSERT itself is
+    # the lock. If another process wins the race, the unique constraint
+    # rejects this insert and we fall through to reconcile below.
+    try:
+        inserted = (
+            sb.table("digests")
+            .insert({**match, **(extra or {}), "status": "pending", "claimed_at": now.isoformat()})
+            .execute()
+        )
+        if inserted.data:
+            return "claimed", inserted.data[0]
+    except Exception as e:
+        logger.debug(f"Digest slot already exists for {match}, reconciling: {e}")
+
+    existing = sb.table("digests").select("*").match(match).execute()
+    if not existing.data:
+        # Extremely unlikely (insert failed for a non-conflict reason) —
+        # fail safe by skipping rather than risking a duplicate.
+        return "skip", None
+    row = existing.data[0]
+    status = row["status"]
+
+    if status in ("generated", "skipped"):
+        return "skip", row
+
+    reclaimable = status == "failed"
+    if status == "pending" and row.get("claimed_at"):
+        claimed_at = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
+        reclaimable = (now - claimed_at) > CLAIM_STALE_AFTER
+
+    if reclaimable:
+        # Conditional update = the reclaim lock. Only succeeds if the row
+        # is still in the state we just read it in, so two workers racing
+        # to reclaim the same stale/failed row can't both win.
+        updated = (
+            sb.table("digests")
+            .update({"status": "pending", "claimed_at": now.isoformat()})
+            .eq("id", row["id"])
+            .eq("status", status)
+            .execute()
+        )
+        if updated.data:
+            return "claimed", updated.data[0]
+        return "skip", row
+
+    # status == "pending" and still fresh — another worker is actively on it.
+    return "skip", row
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -261,26 +337,27 @@ def _format_recent_context(nodes: list) -> str:
 
 # ── Main generator ────────────────────────────────────────────────────────────
 
-async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str = "night") -> dict:
+async def generate_digest(
+    clerk_user_id: str,
+    period: str = "daily",
+    slot: str = "night",
+    reference_date: Optional[date] = None,
+) -> dict:
+    """
+    reference_date: the "today" to anchor the slot's target date on, in the
+    *user's* local calendar — not the server's. Callers (like the scheduler)
+    should pass the user's local date; it defaults to the server's local
+    date only for convenience (manual/test calls).
+    """
     sb = get_supabase()
-    today = date.today()
+    today = reference_date or date.today()
 
     target_date = today - timedelta(days=1) if slot == "morning" else today
     date_start = date_end = target_date
     prompt_template = MORNING_PROMPT if slot == "morning" else NIGHT_PROMPT
     date_label = target_date.strftime("%A, %d %B %Y")
-
-    # Idempotency
-    existing = (
-        sb.table("digests")
-        .select("id, status")
-        .eq("clerk_user_id", clerk_user_id)
-        .eq("period", period)
-        .eq("date_start", date_start.isoformat())
-        .execute()
-    )
-    if existing.data and existing.data[0]["status"] == "generated":
-        return existing.data[0]
+    
+    logger.info(f"Starting digest generation: user={clerk_user_id}, slot={slot}, target_date={target_date}")
 
     # Profile
     profile = (
@@ -291,6 +368,7 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
         .execute()
     )
     if not profile.data:
+        logger.error(f"Profile not found for {clerk_user_id}")
         raise RuntimeError("Profile not found.")
 
     display_name = profile.data["display_name"]
@@ -301,7 +379,44 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
 
     # Skip if digest disabled
     if not profile.data.get("digest_enabled", True):
+        logger.info(f"Digest disabled for {clerk_user_id}")
         raise RuntimeError("Digest disabled for this user.")
+
+    # Claim this digest slot — also our idempotency + distributed-lock check.
+    claim_status, claim_row = _claim_digest_slot(sb, {
+        "clerk_user_id": clerk_user_id,
+        "period": period,
+        "date_start": date_start.isoformat(),
+        "date_end": date_end.isoformat(),
+    })
+    if claim_status == "skip":
+        logger.info(f"Digest slot for {clerk_user_id} on {target_date} already handled ({(claim_row or {}).get('status')})")
+        return claim_row or {"status": "skipped", "reason": "Already handled by another worker."}
+
+    digest_id = claim_row["id"]
+    window_end = datetime.now(timezone.utc)
+
+    # Rolling coverage window: resume from where the last digest left off
+    # (its covered_until) instead of a fixed calendar-day boundary, so
+    # nodes logged after a previous digest was generated — e.g. after
+    # 10pm for a night digest — are never silently dropped.
+    prev_coverage = (
+        sb.table("digests")
+        .select("covered_until")
+        .eq("clerk_user_id", clerk_user_id)
+        .eq("period", period)
+        .neq("id", digest_id)
+        .not_.is_("covered_until", "null")
+        .order("covered_until", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if prev_coverage.data:
+        window_start = datetime.fromisoformat(prev_coverage.data[0]["covered_until"].replace("Z", "+00:00"))
+    else:
+        window_start = datetime.fromisoformat(f"{date_start.isoformat()}T00:00:00+00:00")
+    window_start_iso = window_start.isoformat()
+    window_end_iso = window_end.isoformat()
 
     # Streak
     streak_res = (
@@ -335,13 +450,13 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
         if names:
             member_names = ", ".join(names)
 
-    # User's logs for target date
+    # User's logs since the last digest's coverage cutoff (rolling window)
     user_nodes_res = (
         sb.table("nodes")
         .select("logged_at, type, title, content")
         .eq("clerk_user_id", clerk_user_id)
-        .gte("logged_at", f"{date_start.isoformat()}T00:00:00")
-        .lte("logged_at", f"{date_end.isoformat()}T23:59:59")
+        .gte("logged_at", window_start_iso)
+        .lte("logged_at", window_end_iso)
         .order("logged_at")
         .execute()
     )
@@ -350,14 +465,14 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
     # Saves Groq credits and avoids a hollow, padded digest
     MIN_NODES = 3
     user_nodes = user_nodes_res.data or []
+    logger.info(f"Found {len(user_nodes)} nodes for {clerk_user_id} in window {window_start_iso} -> {window_end_iso}")
+
     if len(user_nodes) < MIN_NODES:
-        sb.table("digests").upsert({
-            "clerk_user_id": clerk_user_id,
-            "period": period,
-            "date_start": date_start.isoformat(),
-            "date_end": date_end.isoformat(),
+        logger.info(f"Insufficient nodes ({len(user_nodes)}/{MIN_NODES}) for {clerk_user_id}, skipping digest")
+        sb.table("digests").update({
             "status": "skipped",
-        }, on_conflict="clerk_user_id,period,date_start").execute()
+            "covered_until": window_end_iso,
+        }).eq("id", digest_id).execute()
         return {
             "status": "skipped",
             "reason": f"Only {len(user_nodes)} log(s) — minimum is {MIN_NODES} to generate a digest.",
@@ -371,8 +486,8 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
             .select("id, title")
             .eq("clerk_user_id", clerk_user_id)
             .eq("visibility", "shared")
-            .gte("logged_at", f"{date_start.isoformat()}T00:00:00")
-            .lte("logged_at", f"{date_end.isoformat()}T23:59:59")
+            .gte("logged_at", window_start_iso)
+            .lte("logged_at", window_end_iso)
             .execute()
         )
         if shared.data:
@@ -389,7 +504,7 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
                 r["node_title"] = title_map.get(r["node_id"])
             user_reactions = reactions_res.data or []
 
-    # Circle's shared logs for target date
+    # Circle's shared logs for the same rolling window
     group_nodes = []
     if group_id:
         group_res = (
@@ -398,21 +513,21 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
             .eq("group_id", group_id)
             .eq("visibility", "shared")
             .neq("clerk_user_id", clerk_user_id)
-            .gte("logged_at", f"{date_start.isoformat()}T00:00:00")
-            .lte("logged_at", f"{date_end.isoformat()}T23:59:59")
+            .gte("logged_at", window_start_iso)
+            .lte("logged_at", window_end_iso)
             .order("logged_at")
             .execute()
         )
         group_nodes = group_res.data or []
 
-    # Last 7 days context (excluding target date)
+    # Last 7 days context (excluding the current window)
     week_ago = (target_date - timedelta(days=7)).isoformat()
     recent_res = (
         sb.table("nodes")
         .select("logged_at, type")
         .eq("clerk_user_id", clerk_user_id)
         .gte("logged_at", f"{week_ago}T00:00:00")
-        .lt("logged_at", f"{date_start.isoformat()}T00:00:00")
+        .lt("logged_at", window_start_iso)
         .execute()
     )
 
@@ -432,33 +547,32 @@ async def generate_digest(clerk_user_id: str, period: str = "daily", slot: str =
         recent_context=_format_recent_context(recent_res.data or []),
     )
 
-    # Insert pending record
-    pending = sb.table("digests").upsert({
-        "clerk_user_id": clerk_user_id,
-        "period": period,
-        "date_start": date_start.isoformat(),
-        "date_end": date_end.isoformat(),
-        "status": "pending",
-    }, on_conflict="clerk_user_id,period,date_start").execute()
-    digest_id = pending.data[0]["id"]
-
     try:
-        response = await groq_client.chat.completions.create(
-            model=settings.GROQ_MODEL,
-            temperature=0.85,
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
+        logger.info(f"Calling Gemini API for {clerk_user_id}...")
+        response = await gemini_client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            # gemini-flash-latest reasons before answering and that "thinking" eats
+            # into max_output_tokens — budget generously so the actual digest text
+            # doesn't get cut off mid-sentence once thinking is done.
+            config={"temperature": 0.85, "max_output_tokens": 3000},
         )
-        content = response.choices[0].message.content
+        content = response.text
+        logger.info(f"Gemini API successful for {clerk_user_id}, content length: {len(content)} chars")
 
         result = sb.table("digests").update({
             "content": content,
             "status": "generated",
             "generated_at": datetime.utcnow().isoformat(),
+            "covered_until": window_end_iso,
         }).eq("id", digest_id).execute()
 
+        logger.info(f"✅ Digest saved successfully for {clerk_user_id}")
         return result.data[0]
 
     except Exception as e:
+        logger.error(f"❌ Gemini API or save failed for {clerk_user_id}: {e}", exc_info=True)
+        # Leave covered_until unset on failure — the retry will recompute the
+        # same window (plus anything new) rather than losing this coverage.
         sb.table("digests").update({"status": "failed"}).eq("id", digest_id).execute()
         raise RuntimeError(f"Digest generation failed: {e}")
