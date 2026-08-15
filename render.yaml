@@ -7,6 +7,8 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: CLERK_WEBHOOK_SECRET
         sync: false
       - key: CLERK_JWKS_URL
