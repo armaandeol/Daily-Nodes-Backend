@@ -364,7 +364,7 @@ async def generate_digest(
         sb.table("profiles")
         .select("display_name, group_id, timezone, bio, digest_enabled")
         .eq("clerk_user_id", clerk_user_id)
-        .single()
+        .maybe_single()
         .execute()
     )
     if not profile.data:
@@ -423,7 +423,7 @@ async def generate_digest(
         sb.table("streaks")
         .select("streak_count")
         .eq("clerk_user_id", clerk_user_id)
-        .single()
+        .maybe_single()
         .execute()
     )
     streak_days = streak_res.data.get("streak_count", 0) if streak_res.data else 0
@@ -433,7 +433,7 @@ async def generate_digest(
     member_names = "no one else yet"
     members = []
     if group_id:
-        grp = sb.table("groups").select("name").eq("id", group_id).single().execute()
+        grp = sb.table("groups").select("name").eq("id", group_id).maybe_single().execute()
         group_name = grp.data["name"] if grp.data else "your circle"
         members_res = (
             sb.table("group_members")
