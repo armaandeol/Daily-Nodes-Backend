@@ -367,7 +367,7 @@ async def generate_digest(
         .maybe_single()
         .execute()
     )
-    if not profile.data:
+    if not profile or not profile.data:
         logger.error(f"Profile not found for {clerk_user_id}")
         raise RuntimeError("Profile not found.")
 
@@ -426,7 +426,7 @@ async def generate_digest(
         .maybe_single()
         .execute()
     )
-    streak_days = streak_res.data.get("streak_count", 0) if streak_res.data else 0
+    streak_days = streak_res.data.get("streak_count", 0) if streak_res and streak_res.data else 0
 
     # Group info + members
     group_name = "your circle"
@@ -434,7 +434,7 @@ async def generate_digest(
     members = []
     if group_id:
         grp = sb.table("groups").select("name").eq("id", group_id).maybe_single().execute()
-        group_name = grp.data["name"] if grp.data else "your circle"
+        group_name = grp.data["name"] if grp and grp.data else "your circle"
         members_res = (
             sb.table("group_members")
             .select("clerk_user_id, profiles(display_name)")

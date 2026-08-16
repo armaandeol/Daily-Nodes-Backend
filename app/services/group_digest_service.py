@@ -112,7 +112,7 @@ async def generate_group_weekly_digest(group_id: str) -> dict:
 
     # Fetch group info
     group = sb.table("groups").select("name").eq("id", group_id).maybe_single().execute()
-    group_name = group.data["name"] if group.data else "Your group"
+    group_name = group.data["name"] if group and group.data else "Your group"
 
     # Fetch members
     members = (
