@@ -374,7 +374,7 @@ async def generate_digest(
     display_name = profile.data["display_name"]
     first_name = display_name.split()[0]
     group_id = profile.data.get("group_id")
-    timezone = profile.data.get("timezone", "Asia/Kolkata")
+    user_timezone = profile.data.get("timezone", "Asia/Kolkata")
     user_bio = profile.data.get("bio") or "No bio provided."
 
     # Skip if digest disabled
@@ -537,7 +537,7 @@ async def generate_digest(
         display_name=display_name,
         first_name=first_name,
         streak_days=streak_days,
-        timezone=timezone,
+        timezone=user_timezone,
         group_name=group_name,
         member_names=member_names,
         user_bio=user_bio,
