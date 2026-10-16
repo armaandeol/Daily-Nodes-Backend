@@ -10,12 +10,13 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
 
-    # Groq (legacy — no longer used by digest generation, kept optional so old .env files don't break)
-    GROQ_API_KEY: str = ""
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    # Groq — primary digest LLM provider
+    GROQ_API_KEY: str
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
 
-    # Gemini
-    GEMINI_API_KEY: str
+    # Gemini (legacy — no longer used by digest generation, kept optional so old
+    # .env files don't break; dropped after Gemini's prepay credits ran out)
+    GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-flash-latest"
 
     # Frontend

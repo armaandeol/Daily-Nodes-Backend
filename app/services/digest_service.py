@@ -3,17 +3,17 @@ from datetime import date, timedelta, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 from collections import Counter
-from google import genai
-from pydantic import BaseModel
+from groq import AsyncGroq
+from pydantic import BaseModel, ConfigDict
 from app.config import settings
 from app.services.supabase_client import get_supabase
 import logging
 
-gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 logger = logging.getLogger(__name__)
 
 # A claimed-but-never-finished row (worker crashed mid-generation) is
-# reclaimable after this long — long enough to outlast a slow Gemini call.
+# reclaimable after this long — long enough to outlast a slow Groq call.
 CLAIM_STALE_AFTER = timedelta(minutes=15)
 
 # Public Supabase Storage bucket of themed stock photos, used as the
@@ -120,22 +120,29 @@ def _claim_digest_slot(sb, match: dict, extra: Optional[dict] = None) -> tuple[s
 
 
 # ── Structured output schema ─────────────────────────────────────────────────
-# Gemini fills this in directly (response_schema) instead of writing
+# Groq fills this in directly (structured-output strict mode) instead of
 # free-text with bracketed headers — see generate_digest().
 
 class DigestSections(BaseModel):
+    # Groq's structured-output strict mode requires every field to be
+    # listed as required (nullable fields are modeled as `Optional[x]`
+    # *without* a default, so the model must always supply them — `null`
+    # is a valid value, a missing key is not) and forbids extra
+    # properties — hence `extra="forbid"` below.
+    model_config = ConfigDict(extra="forbid")
+
     headline: str
     tapestry: str
-    circle_headline: Optional[str] = None
-    circle: Optional[str] = None
+    circle_headline: Optional[str]
+    circle: Optional[str]
     pivot: str
     pull_quote: str
     # 0 = no photo earns the front page; otherwise a 1-based index into the
     # numbered "photos today" list injected into the prompt.
-    photo_choice: int = 0
-    photo_caption: Optional[str] = None
-    circle_photo_choice: int = 0
-    circle_photo_caption: Optional[str] = None
+    photo_choice: int
+    photo_caption: Optional[str]
+    circle_photo_choice: int
+    circle_photo_caption: Optional[str]
 
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
@@ -452,7 +459,7 @@ def _format_recent_context(nodes: list) -> str:
 
 def _photo_candidates(nodes: list) -> list:
     """Nodes eligible as a front-page photo: has an image, and has enough
-    text that Gemini can judge whether it's caption-worthy without ever
+    text that Groq can judge whether it's caption-worthy without ever
     seeing the image itself."""
     return [n for n in nodes if n.get("image_url") and (n.get("content") or "").strip()]
 
@@ -508,7 +515,7 @@ def _resolve_photo(
     caption: Optional[str],
     fallback_theme: str,
 ) -> dict:
-    """Turns Gemini's photo_choice into a stored photo descriptor. Real log
+    """Turns Groq's photo_choice into a stored photo descriptor. Real log
     photos are stored by node_id only (never a signed URL — those expire);
     the signed URL is resolved fresh at read time by digest_sections.py."""
     if candidates and 1 <= choice <= len(candidates):
@@ -748,7 +755,7 @@ async def generate_digest(
     stats = _compute_stats(user_nodes, streak_days, user_timezone)
 
     # Photo candidates — numbered lists of today's image nodes, judged by
-    # Gemini on their caption text only (never the image itself).
+    # Groq on their caption text only (never the image itself).
     own_photo_candidates = _photo_candidates(user_nodes)
     circle_photo_candidates = _photo_candidates(group_nodes)
 
@@ -771,27 +778,30 @@ async def generate_digest(
     )
 
     try:
-        logger.info(f"Calling Gemini API for {clerk_user_id}...")
-        response = await gemini_client.aio.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            # gemini-flash-latest reasons before answering and that "thinking" eats
-            # into max_output_tokens — budget generously so the actual digest text
-            # doesn't get cut off mid-sentence once thinking is done.
-            config={
-                "temperature": 0.85,
-                "max_output_tokens": 3000,
-                "response_mime_type": "application/json",
-                "response_schema": DigestSections,
+        logger.info(f"Calling Groq API for {clerk_user_id}...")
+        response = await groq_client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.85,
+            # GPT-OSS reasons before answering by default and that eats into
+            # the token budget — keep some reasoning (quality matters for the
+            # "surface the invisible" rule) but don't pay for it in the
+            # response, and budget generously so the JSON doesn't get cut
+            # off mid-field once reasoning is done.
+            reasoning_effort="medium",
+            include_reasoning=False,
+            max_completion_tokens=3000,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "digest_sections",
+                    "strict": True,
+                    "schema": DigestSections.model_json_schema(),
+                },
             },
         )
-        sections = response.parsed
-        if sections is None:
-            # Defensive fallback — .parsed can be None if Gemini's output
-            # didn't strictly match the schema; response.text is still the
-            # raw JSON in that case.
-            sections = DigestSections.model_validate_json(response.text)
-        logger.info(f"Gemini API successful for {clerk_user_id}")
+        sections = DigestSections.model_validate_json(response.choices[0].message.content)
+        logger.info(f"Groq API successful for {clerk_user_id}")
 
         # has_circle is a server-side fact (does this user belong to a
         # group at all), not something the LLM gets to decide — even if it
@@ -834,7 +844,7 @@ async def generate_digest(
         return result.data[0]
 
     except Exception as e:
-        logger.error(f"❌ Gemini API or save failed for {clerk_user_id}: {e}", exc_info=True)
+        logger.error(f"❌ Groq API or save failed for {clerk_user_id}: {e}", exc_info=True)
         # Leave covered_until unset on failure — the retry will recompute the
         # same window (plus anything new) rather than losing this coverage.
         sb.table("digests").update({"status": "failed"}).eq("id", digest_id).execute()

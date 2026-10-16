@@ -1,11 +1,11 @@
 from datetime import date, timedelta, datetime
-from google import genai
+from groq import AsyncGroq
 from app.config import settings
 from app.services.supabase_client import get_supabase
 from app.services.digest_service import _claim_digest_slot
 from collections import Counter
 
-gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 
 GROUP_WEEKLY_PROMPT = """
 You are the editorial voice of Roz — a premium life-logging app (Roz means "daily" in Punjabi). \
@@ -166,13 +166,17 @@ async def generate_group_weekly_digest(group_id: str) -> dict:
     )
 
     try:
-        response = await gemini_client.aio.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=prompt,
-            # See digest_service.py — thinking tokens share this budget, so keep it generous.
-            config={"temperature": 0.7, "max_output_tokens": 2000},
+        response = await groq_client.chat.completions.create(
+            model=settings.GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            # See digest_service.py — GPT-OSS reasons by default; keep it but
+            # don't pay for the trace in the response.
+            reasoning_effort="medium",
+            include_reasoning=False,
+            max_completion_tokens=2000,
         )
-        content = response.text
+        content = response.choices[0].message.content
 
         result = sb.table("digests").update({
             "content": content,
