@@ -168,12 +168,7 @@ day with the Circle's when relevant — the popcorn moment, the shared study ses
 gym day. Who was the MVP yesterday? Mention reactions if they add real flavour.]
 
 The Pivot
-[1-2 sentences only. 11. BE CHALLENGING, NOT NICE. You are allowed — encouraged — to provoke. Call out the gap
-between what {first_name} says they want and what they actually did. Ask the uncomfortable
-question. Refuse to let a slipping goal slide quietly. But every challenge must be anchored
-to a specific fact in the data — name it. Provocation without evidence is just noise, and it
-is forbidden. The goal is to instigate action, never to make them feel small. If you have
-nothing real to push on, don't manufacture a fight — stay honest instead.
+[1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.]
 
 
 Tone: magazine-style. Warm but alive. Like a smart, honest friend who actually read everything. \
@@ -259,12 +254,7 @@ there's something real to connect. If a reaction landed in a funny or meaningful
 in. Warm, human, not newsy.]
 
 For Tomorrow
-[1-2 sentences only. 11. BE CHALLENGING, NOT NICE. You are allowed — encouraged — to provoke. Call out the gap
-between what {first_name} says they want and what they actually did. Ask the uncomfortable
-question. Refuse to let a slipping goal slide quietly. But every challenge must be anchored
-to a specific fact in the data — name it. Provocation without evidence is just noise, and it
-is forbidden. The goal is to instigate action, never to make them feel small. If you have
-nothing real to push on, don't manufacture a fight — stay honest instead.
+[1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.]
 
 
 Tone: calm but alive. Evening tea with a close friend who has been paying attention all day. \
