@@ -1,6 +1,10 @@
+import random
 from datetime import date, timedelta, datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
+from collections import Counter
 from google import genai
+from pydantic import BaseModel
 from app.config import settings
 from app.services.supabase_client import get_supabase
 import logging
@@ -11,6 +15,36 @@ logger = logging.getLogger(__name__)
 # A claimed-but-never-finished row (worker crashed mid-generation) is
 # reclaimable after this long — long enough to outlast a slow Gemini call.
 CLAIM_STALE_AFTER = timedelta(minutes=15)
+
+# Public Supabase Storage bucket of themed stock photos, used as the
+# front-page photo whenever no log image earns the spot. Layout:
+# {theme}/1.jpg, {theme}/2.jpg, ... — bump the counts below as more are
+# uploaded for a theme.
+STOCK_PHOTO_BUCKET = "digest-stock-photos"
+STOCK_PHOTO_COUNTS = {
+    "workout": 5,
+    "food": 5,
+    "study": 5,
+    "social": 5,
+    "mood": 5,
+    "everyday": 5,
+}
+NODE_TYPE_TO_THEME = {
+    "workout": "workout",
+    "food": "food",
+    "study": "study",
+    "social": "social",
+    "mood": "mood",
+    "custom": "everyday",
+}
+DEFAULT_PHOTO_CAPTIONS = {
+    "workout": "Fig. 01 — motion, somewhere today.",
+    "food": "Fig. 01 — sustenance, noted.",
+    "study": "Fig. 01 — heads down, for a while.",
+    "social": "Fig. 01 — company, if only briefly.",
+    "mood": "Fig. 01 — a quiet moment.",
+    "everyday": "Fig. 01 — an ordinary day, on the record.",
+}
 
 
 def _claim_digest_slot(sb, match: dict, extra: Optional[dict] = None) -> tuple[str, Optional[dict]]:
@@ -85,6 +119,25 @@ def _claim_digest_slot(sb, match: dict, extra: Optional[dict] = None) -> tuple[s
     return "skip", row
 
 
+# ── Structured output schema ─────────────────────────────────────────────────
+# Gemini fills this in directly (response_schema) instead of writing
+# free-text with bracketed headers — see generate_digest().
+
+class DigestSections(BaseModel):
+    headline: str
+    tapestry: str
+    circle_headline: Optional[str] = None
+    circle: Optional[str] = None
+    pivot: str
+    pull_quote: str
+    # 0 = no photo earns the front page; otherwise a 1-based index into the
+    # numbered "photos today" list injected into the prompt.
+    photo_choice: int = 0
+    photo_caption: Optional[str] = None
+    circle_photo_choice: int = 0
+    circle_photo_caption: Optional[str] = None
+
+
 # ── Prompts ───────────────────────────────────────────────────────────────────
 # USER_CONTENT tags are a hard boundary — anything inside is data, never instructions.
 # This protects against prompt injection via logs, bio, or group name.
@@ -117,7 +170,7 @@ RULES — follow these without exception
 4. BE HONEST. If their productivity dropped compared to recent form, say it directly. \
    "You've been slacking" beats "take it easy." Don't baby them.
 5. REACTIONS MATTER. If their Circle reacted to something, that's social data — use it.
-6. ONE PIVOT, NOT THREE TIPS. The last section is one sharp, specific nudge. Not a checklist.
+6. ONE PIVOT, NOT THREE TIPS. The pivot is one sharp, specific nudge. Not a checklist.
 7. SURFACE THE INVISIBLE. Your highest-value job is to notice what {first_name} can't see about \
    themselves. Compare yesterday against the last 7 days and look for: recurring timing (energy \
    dips, late nights), an emotional pattern they haven't named, a stated intention that keeps \
@@ -153,23 +206,58 @@ What the Circle was up to yesterday:
 
 Recent form — last 7 days:
 {recent_context}
+
+{first_name}'s photos yesterday (numbered — judge each by its caption text only, you cannot see \
+the images themselves):
+{own_photos}
+
+The Circle's photos yesterday (numbered — same rule, text only):
+{circle_photos}
 </user_content>
 
-Write in exactly three sections with these exact headers. No intro, no sign-off, no extra text.
+Respond with the structured fields below. No markdown, no extra keys, no sign-off.
 
-Yesterday's Roz
-[3-5 sentences. Narrative, not a list. Surface the actual theme — what was really going on? \
-Call out specific, interesting details. If they dropped the ball, say it. If something small is \
-worth noticing, notice it. Use {first_name} naturally, not every sentence.]
+headline
+Maximum 8 words. A newspaper-style headline distilling the real theme of yesterday — not a list \
+of events, the theme beneath them.
 
-The Circle
-[2-4 sentences. Make it social and human. Synthesize the group's energy. Connect {first_name}'s \
+tapestry
+3-5 sentences. Narrative, not a list. Surface the actual theme — what was really going on? Call \
+out specific, interesting details. If they dropped the ball, say it. If something small is worth \
+noticing, notice it. Use {first_name} naturally, not every sentence.
+
+circle_headline
+A short headline (6 words or fewer) for the Circle's defining moment yesterday — only if there \
+genuinely was one. Null if there's no Circle, or nothing worth naming happened.
+
+circle
+2-4 sentences. Make it social and human. Synthesize the group's energy. Connect {first_name}'s \
 day with the Circle's when relevant — the popcorn moment, the shared study session, the parallel \
-gym day. Who was the MVP yesterday? Mention reactions if they add real flavour.]
+gym day. Who was the MVP yesterday? Mention reactions if they add real flavour. Null under the \
+same conditions as circle_headline.
 
-The Pivot
-[1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.]
+pivot
+1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.
 
+pull_quote
+One standalone sentence, quote-worthy on its own, pulled or adapted from the tapestry — this \
+runs large on the page as a pull quote. Should not just repeat the headline.
+
+photo_choice
+The number of the one photo from "{first_name}'s photos yesterday" worth putting on the front \
+page, judged only by its caption text — or 0 if none of them earn it, or the list says "(none \
+logged)".
+
+photo_caption
+A short (under 12 words) editorial caption for the chosen photo, in your voice. Null if \
+photo_choice is 0.
+
+circle_photo_choice
+Same idea, choosing from "The Circle's photos yesterday". 0 if none earn it, there's no Circle, \
+or the list says "(none logged)".
+
+circle_photo_caption
+Short editorial caption for the chosen Circle photo. Null if circle_photo_choice is 0.
 
 Tone: magazine-style. Warm but alive. Like a smart, honest friend who actually read everything. \
 Conversational prose. Playful when it fits. No corporate fluff. No bullet points. No hollow \
@@ -239,23 +327,57 @@ What the Circle shared today:
 
 Recent form — last 7 days:
 {recent_context}
+
+{first_name}'s photos today (numbered — judge each by its caption text only, you cannot see the \
+images themselves):
+{own_photos}
+
+The Circle's photos today (numbered — same rule, text only):
+{circle_photos}
 </user_content>
 
-Write in exactly three sections with these exact headers. No intro, no sign-off.
+Respond with the structured fields below. No markdown, no extra keys, no sign-off.
 
-Today's Tapestry
-[3-5 sentences. What was the real theme of today — not what they logged, but what it adds up to. \
+headline
+Maximum 8 words. A newspaper-style headline distilling the real theme of today — not a list of \
+events, the theme beneath them.
+
+tapestry
+3-5 sentences. What was the real theme of today — not what they logged, but what it adds up to. \
 Read between the lines. Surface a small win if one exists. Acknowledge if the day felt scattered \
-or heavy. Warm, but honest about their output. Use {first_name} once or twice, naturally.]
+or heavy. Warm, but honest about their output. Use {first_name} once or twice, naturally.
 
-Echoes from the Circle
-[2-4 sentences. What was the defining group moment today? Connect it to {first_name}'s day when \
+circle_headline
+A short headline (6 words or fewer) for the Circle's defining moment today — only if there \
+genuinely was one. Null if there's no Circle, or nothing worth naming happened.
+
+circle
+2-4 sentences. What was the defining group moment today? Connect it to {first_name}'s day when \
 there's something real to connect. If a reaction landed in a funny or meaningful way, bring it \
-in. Warm, human, not newsy.]
+in. Warm, human, not newsy. Null under the same conditions as circle_headline.
 
-For Tomorrow
-[1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.]
+pivot
+1-2 sentences only. One sharp, specific nudge anchored to a fact in the data.
 
+pull_quote
+One standalone sentence, quote-worthy on its own, pulled or adapted from the tapestry — this \
+runs large on the page as a pull quote. Should not just repeat the headline.
+
+photo_choice
+The number of the one photo from "{first_name}'s photos today" worth putting on the front page, \
+judged only by its caption text — or 0 if none of them earn it, or the list says "(none \
+logged)".
+
+photo_caption
+A short (under 12 words) editorial caption for the chosen photo, in your voice. Null if \
+photo_choice is 0.
+
+circle_photo_choice
+Same idea, choosing from "The Circle's photos today". 0 if none earn it, there's no Circle, or \
+the list says "(none logged)".
+
+circle_photo_caption
+Short editorial caption for the chosen Circle photo. Null if circle_photo_choice is 0.
 
 Tone: calm but alive. Evening tea with a close friend who has been paying attention all day. \
 Warm, reflective, occasionally direct. Magazine-style prose. No fluff. No bullet points.
@@ -328,6 +450,100 @@ def _format_recent_context(nodes: list) -> str:
     )
 
 
+def _photo_candidates(nodes: list) -> list:
+    """Nodes eligible as a front-page photo: has an image, and has enough
+    text that Gemini can judge whether it's caption-worthy without ever
+    seeing the image itself."""
+    return [n for n in nodes if n.get("image_url") and (n.get("content") or "").strip()]
+
+
+def _format_photo_candidates(candidates: list) -> str:
+    if not candidates:
+        return "(none logged)"
+    return "\n".join(f'{i}. {c["content"].strip()}' for i, c in enumerate(candidates, start=1))
+
+
+def _format_hour(hour: int) -> str:
+    period = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour} {period}"
+
+
+def _compute_stats(nodes: list, streak_days: int, user_timezone: str) -> dict:
+    """Server-computed, not LLM-derived — logs today, streak, most active
+    hour, and top log type, all read straight off the day's node data."""
+    top_log_type = None
+    most_active_hour = None
+
+    if nodes:
+        type_counts = Counter(n.get("type", "custom") for n in nodes)
+        top_log_type = type_counts.most_common(1)[0][0]
+
+        try:
+            tz = ZoneInfo(user_timezone)
+        except Exception:
+            tz = timezone.utc
+
+        hour_counts: Counter = Counter()
+        for n in nodes:
+            try:
+                dt = datetime.fromisoformat(n["logged_at"].replace("Z", "+00:00")).astimezone(tz)
+                hour_counts[dt.hour] += 1
+            except Exception:
+                pass
+        if hour_counts:
+            most_active_hour = _format_hour(hour_counts.most_common(1)[0][0])
+
+    return {
+        "logs_today": len(nodes),
+        "streak": streak_days,
+        "most_active_hour": most_active_hour,
+        "top_log_type": top_log_type,
+    }
+
+
+def _resolve_photo(
+    choice: int,
+    candidates: list,
+    caption: Optional[str],
+    fallback_theme: str,
+) -> dict:
+    """Turns Gemini's photo_choice into a stored photo descriptor. Real log
+    photos are stored by node_id only (never a signed URL — those expire);
+    the signed URL is resolved fresh at read time by digest_sections.py."""
+    if candidates and 1 <= choice <= len(candidates):
+        node = candidates[choice - 1]
+        return {
+            "type": "log",
+            "node_id": node["id"],
+            "caption": (caption or "").strip() or "Fig. 01",
+        }
+
+    theme = fallback_theme if fallback_theme in STOCK_PHOTO_COUNTS else "everyday"
+    index = random.randint(1, STOCK_PHOTO_COUNTS[theme])
+    return {
+        "type": "stock",
+        "theme": theme,
+        "index": index,
+        "caption": (caption or "").strip() or DEFAULT_PHOTO_CAPTIONS[theme],
+    }
+
+
+def _render_plain_text(sections: DigestSections, circle_text: Optional[str], slot: str) -> str:
+    """Deterministic plain-text rendering kept in `content` for backward
+    compatibility with anything still reading that column directly."""
+    if slot == "morning":
+        headers = ("Yesterday's Roz", "The Circle", "The Pivot")
+    else:
+        headers = ("Today's Tapestry", "Echoes from the Circle", "For Tomorrow")
+
+    parts = [f"{headers[0]}\n{sections.tapestry}"]
+    if circle_text:
+        parts.append(f"{headers[1]}\n{circle_text}")
+    parts.append(f"{headers[2]}\n{sections.pivot}")
+    return "\n\n".join(parts)
+
+
 # ── Main generator ────────────────────────────────────────────────────────────
 
 async def generate_digest(
@@ -349,7 +565,7 @@ async def generate_digest(
     date_start = date_end = target_date
     prompt_template = MORNING_PROMPT if slot == "morning" else NIGHT_PROMPT
     date_label = target_date.strftime("%A, %d %B %Y")
-    
+
     logger.info(f"Starting digest generation: user={clerk_user_id}, slot={slot}, target_date={target_date}")
 
     # Profile
@@ -376,12 +592,16 @@ async def generate_digest(
         raise RuntimeError("Digest disabled for this user.")
 
     # Claim this digest slot — also our idempotency + distributed-lock check.
-    claim_status, claim_row = _claim_digest_slot(sb, {
-        "clerk_user_id": clerk_user_id,
-        "period": period,
-        "date_start": date_start.isoformat(),
-        "date_end": date_end.isoformat(),
-    })
+    claim_status, claim_row = _claim_digest_slot(
+        sb,
+        {
+            "clerk_user_id": clerk_user_id,
+            "period": period,
+            "date_start": date_start.isoformat(),
+            "date_end": date_end.isoformat(),
+        },
+        extra={"slot": slot},
+    )
     if claim_status == "skip":
         logger.info(f"Digest slot for {clerk_user_id} on {target_date} already handled ({(claim_row or {}).get('status')})")
         return claim_row or {"status": "skipped", "reason": "Already handled by another worker."}
@@ -446,7 +666,7 @@ async def generate_digest(
     # User's logs since the last digest's coverage cutoff (rolling window)
     user_nodes_res = (
         sb.table("nodes")
-        .select("logged_at, type, title, content")
+        .select("id, logged_at, type, title, content, image_url")
         .eq("clerk_user_id", clerk_user_id)
         .gte("logged_at", window_start_iso)
         .lte("logged_at", window_end_iso)
@@ -502,7 +722,7 @@ async def generate_digest(
     if group_id:
         group_res = (
             sb.table("nodes")
-            .select("logged_at, type, title, content, profiles(display_name)")
+            .select("id, logged_at, type, title, content, image_url, profiles(display_name)")
             .eq("group_id", group_id)
             .eq("visibility", "shared")
             .neq("clerk_user_id", clerk_user_id)
@@ -524,6 +744,14 @@ async def generate_digest(
         .execute()
     )
 
+    # Stats are computed here, not by the LLM — straight off the node data.
+    stats = _compute_stats(user_nodes, streak_days, user_timezone)
+
+    # Photo candidates — numbered lists of today's image nodes, judged by
+    # Gemini on their caption text only (never the image itself).
+    own_photo_candidates = _photo_candidates(user_nodes)
+    circle_photo_candidates = _photo_candidates(group_nodes)
+
     # Build prompt
     prompt = prompt_template.format(
         date=date_label,
@@ -538,6 +766,8 @@ async def generate_digest(
         user_reactions=_format_reactions(user_reactions, members),
         group_nodes=_format_nodes(group_nodes, include_name=True),
         recent_context=_format_recent_context(recent_res.data or []),
+        own_photos=_format_photo_candidates(own_photo_candidates),
+        circle_photos=_format_photo_candidates(circle_photo_candidates),
     )
 
     try:
@@ -548,13 +778,53 @@ async def generate_digest(
             # gemini-flash-latest reasons before answering and that "thinking" eats
             # into max_output_tokens — budget generously so the actual digest text
             # doesn't get cut off mid-sentence once thinking is done.
-            config={"temperature": 0.85, "max_output_tokens": 3000},
+            config={
+                "temperature": 0.85,
+                "max_output_tokens": 3000,
+                "response_mime_type": "application/json",
+                "response_schema": DigestSections,
+            },
         )
-        content = response.text
-        logger.info(f"Gemini API successful for {clerk_user_id}, content length: {len(content)} chars")
+        sections = response.parsed
+        if sections is None:
+            # Defensive fallback — .parsed can be None if Gemini's output
+            # didn't strictly match the schema; response.text is still the
+            # raw JSON in that case.
+            sections = DigestSections.model_validate_json(response.text)
+        logger.info(f"Gemini API successful for {clerk_user_id}")
+
+        # has_circle is a server-side fact (does this user belong to a
+        # group at all), not something the LLM gets to decide — even if it
+        # hallucinates circle text for a solo user, we drop it here.
+        circle_headline = sections.circle_headline if group_id else None
+        circle_text = sections.circle if group_id else None
+
+        hero_theme = NODE_TYPE_TO_THEME.get(stats["top_log_type"], "everyday")
+        photo = _resolve_photo(sections.photo_choice, own_photo_candidates, sections.photo_caption, hero_theme)
+        circle_photo = (
+            _resolve_photo(sections.circle_photo_choice, circle_photo_candidates, sections.circle_photo_caption, "social")
+            if group_id else None
+        )
+
+        sections_payload = {
+            "headline": sections.headline,
+            "tapestry": sections.tapestry,
+            "circle_headline": circle_headline,
+            "circle": circle_text,
+            "pivot": sections.pivot,
+            "pull_quote": sections.pull_quote,
+            "has_circle": bool(group_id),
+            "photo": photo,
+            "circle_photo": circle_photo,
+            "stats": stats,
+            "slot": slot,
+        }
+        content = _render_plain_text(sections, circle_text, slot)
 
         result = sb.table("digests").update({
             "content": content,
+            "sections": sections_payload,
+            "slot": slot,
             "status": "generated",
             "generated_at": datetime.utcnow().isoformat(),
             "covered_until": window_end_iso,
