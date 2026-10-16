@@ -55,10 +55,13 @@ def _claim_digest_slot(sb, match: dict, extra: Optional[dict] = None) -> tuple[s
     row = existing.data[0]
     status = row["status"]
 
-    if status in ("generated", "skipped"):
+    if status == "generated":
         return "skip", row
 
-    reclaimable = status == "failed"
+    # "skipped" means too few nodes were logged *as of the last check* —
+    # not a permanent verdict. More nodes may have landed since, so treat
+    # it like "failed": reclaimable on the next check.
+    reclaimable = status in ("failed", "skipped")
     if status == "pending" and row.get("claimed_at"):
         claimed_at = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
         reclaimable = (now - claimed_at) > CLAIM_STALE_AFTER

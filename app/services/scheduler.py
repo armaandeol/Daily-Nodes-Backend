@@ -83,9 +83,11 @@ async def run_daily_digests():
                 # generate_digest() itself no-ops if already generated for
                 # this slot/date, so it's safe to call every eligible hour.
                 result = await generate_digest(uid, period="daily", slot=slot, reference_date=reference_date)
-                if result.get("status") == "generated" or "content" in result:
+                if result.get("status") == "generated":
                     triggered_count += 1
                     logger.info(f"✅ Digest generated for {uid}")
+                else:
+                    logger.info(f"⏭️ Digest not generated for {uid}: status={result.get('status')}, reason={result.get('reason')}")
 
         except Exception as e:
             logger.error(f"❌ Daily digest failed for {uid}: {e}", exc_info=True)
