@@ -2,6 +2,8 @@ from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from typing import Optional
 import uuid, mimetypes
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from app.services.supabase_client import get_supabase
 from app.services.streak_service import update_streak
 from app.services.profile_service import get_or_create_profile
@@ -39,6 +41,22 @@ def _user_group(clerk_user_id: str) -> Optional[str]:
     sb = get_supabase()
     profile = get_or_create_profile(clerk_user_id, sb=sb)
     return profile.get("group_id")
+
+
+def _local_day_bounds_utc(date_str: str, clerk_user_id: str, sb) -> tuple[str, str]:
+    """Converts a YYYY-MM-DD date into UTC start/end instants using the
+    user's own timezone, so "today" means the user's local today — not
+    the UTC calendar day `logged_at` happens to fall on."""
+    profile = get_or_create_profile(clerk_user_id, sb=sb)
+    tz_name = profile.get("timezone") or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+
+    local_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
+    local_end = local_start + timedelta(days=1)
+    return local_start.isoformat(), local_end.isoformat()
 
 
 def _sign_node_images(nodes_list: list) -> list:
@@ -139,9 +157,8 @@ async def list_nodes(request: Request, limit: int = 20, offset: int = 0, date: O
         query = sb.table("nodes").select("*, profiles(display_name, avatar_url), node_reactions(emoji, clerk_user_id, profiles(display_name))").eq("clerk_user_id", uid)
     
     if date:
-        start_of_day = f"{date}T00:00:00"
-        end_of_day = f"{date}T23:59:59.999999"
-        query = query.gte("logged_at", start_of_day).lte("logged_at", end_of_day)
+        start_of_day, end_of_day = _local_day_bounds_utc(date, uid, sb)
+        query = query.gte("logged_at", start_of_day).lt("logged_at", end_of_day)
         
     result = (
         query
