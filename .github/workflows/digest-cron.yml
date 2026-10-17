@@ -1,9 +1,14 @@
 name: Digest cron
 
-# Pings the deployed backend hourly (and once weekly for the group digest).
-# The ping wakes a sleeping free-tier instance and triggers the same check
-# the in-process scheduler runs on its own — safe to overlap, both go
-# through the same DB-backed distributed lock.
+# Pings the deployed backend every 30 min (and once weekly for the group
+# digest). The ping wakes a sleeping free-tier instance and triggers the
+# same check the in-process scheduler runs on its own — safe to overlap,
+# both go through the same DB-backed distributed lock.
+#
+# Runs on GitHub Actions rather than an external pinger (e.g. cron-job.org)
+# because Render's free-tier cold start can take 50-90s, longer than most
+# external pingers' default request timeout — the --max-time 90 below
+# waits it out instead of giving up and reporting a false failure.
 #
 # Required repo secrets (Settings → Secrets and variables → Actions):
 #   BACKEND_URL   e.g. https://your-app.onrender.com
@@ -11,13 +16,13 @@ name: Digest cron
 
 on:
   schedule:
-    - cron: "0 * * * *"      # every hour, on the hour (UTC)
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
     - cron: "0 20 * * 0"     # Sundays at 20:00 UTC, for the weekly group digest
   workflow_dispatch: {}      # lets you trigger a run manually from the Actions tab
 
 jobs:
   ping-daily:
-    if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '*/30 * * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger daily digest check
