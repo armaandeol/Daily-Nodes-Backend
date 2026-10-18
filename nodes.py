@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel
 from typing import Optional
-import uuid, mimetypes
+import uuid, mimetypes, random
+from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from app.services.supabase_client import get_supabase
@@ -9,6 +10,9 @@ from app.services.streak_service import update_streak
 from app.services.profile_service import get_or_create_profile
 
 router = APIRouter()
+
+VALID_LOG_STYLES = {"postit", "lined", "index", "scrap"}
+DEFAULT_LOG_STYLE = "postit"
 
 
 # ── Models ──────────────────────────────────────────────────────────────────
@@ -43,17 +47,20 @@ def _user_group(clerk_user_id: str) -> Optional[str]:
     return profile.get("group_id")
 
 
+def _user_timezone(clerk_user_id: str, sb) -> ZoneInfo:
+    profile = get_or_create_profile(clerk_user_id, sb=sb)
+    tz_name = profile.get("timezone") or "UTC"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
 def _local_day_bounds_utc(date_str: str, clerk_user_id: str, sb) -> tuple[str, str]:
     """Converts a YYYY-MM-DD date into UTC start/end instants using the
     user's own timezone, so "today" means the user's local today — not
     the UTC calendar day `logged_at` happens to fall on."""
-    profile = get_or_create_profile(clerk_user_id, sb=sb)
-    tz_name = profile.get("timezone") or "UTC"
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("UTC")
-
+    tz = _user_timezone(clerk_user_id, sb)
     local_start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=tz)
     local_end = local_start + timedelta(days=1)
     return local_start.isoformat(), local_end.isoformat()
@@ -191,6 +198,72 @@ async def group_feed(request: Request, limit: int = 20, offset: int = 0):
     return _map_node_reactions(_sign_node_avatars(_sign_node_images(result.data)))
 
 
+@router.get("/activity")
+async def node_activity(
+    request: Request,
+    start: str = Query(..., description="YYYY-MM-DD, inclusive"),
+    end: str = Query(..., description="YYYY-MM-DD, inclusive"),
+):
+    """
+    Per-day log counts for the authenticated user's own nodes between
+    start and end (inclusive), bucketed by their local calendar day.
+    Also picks one random image per day (if any were logged that day) so
+    the profile calendar can show a thumbnail instead of a plain color.
+    Powers the profile contribution calendar.
+    """
+    uid = request.state.clerk_user_id
+    sb = get_supabase()
+    tz = _user_timezone(uid, sb)
+
+    range_start = datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=tz)
+    range_end = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=tz) + timedelta(days=1)
+
+    result = (
+        sb.table("nodes")
+        .select("logged_at, type, image_url")
+        .eq("clerk_user_id", uid)
+        .gte("logged_at", range_start.isoformat())
+        .lt("logged_at", range_end.isoformat())
+        .execute()
+    )
+
+    buckets: dict[str, dict] = defaultdict(lambda: {"count": 0, "types": defaultdict(int), "images": []})
+    for row in result.data:
+        local_dt = datetime.fromisoformat(row["logged_at"]).astimezone(tz)
+        day_key = local_dt.strftime("%Y-%m-%d")
+        bucket = buckets[day_key]
+        bucket["count"] += 1
+        bucket["types"][row["type"]] += 1
+        if row["image_url"]:
+            bucket["images"].append(row["image_url"])
+
+    # Pick one random image path per day, then batch-sign all of them in a
+    # single storage call rather than fetching each day's full node list.
+    chosen_paths: dict[str, str] = {
+        day_key: random.choice(bucket["images"])
+        for day_key, bucket in buckets.items()
+        if bucket["images"]
+    }
+    signed_url_map: dict[str, str] = {}
+    if chosen_paths:
+        try:
+            signed_res = sb.storage.from_("node-images").create_signed_urls(list(chosen_paths.values()), 3600)
+            signed_url_map = {item["path"]: item["signedURL"] for item in signed_res if "signedURL" in item}
+        except Exception as e:
+            print("Error batch signing activity thumbnails:", e)
+
+    days = [
+        {
+            "date": day_key,
+            "count": bucket["count"],
+            "top_type": max(bucket["types"].items(), key=lambda kv: kv[1])[0],
+            "thumbnail_url": signed_url_map.get(chosen_paths.get(day_key)),
+        }
+        for day_key, bucket in buckets.items()
+    ]
+    return {"days": days}
+
+
 @router.post("/")
 async def create_node(
     request: Request,
@@ -199,6 +272,7 @@ async def create_node(
     title: Optional[str] = Form(None),
     content: Optional[str] = Form(None),
     metadata: Optional[str] = Form("{}"),
+    style: str = Form(DEFAULT_LOG_STYLE),
     image: Optional[UploadFile] = File(None),
 ):
     """
@@ -259,6 +333,7 @@ async def create_node(
         "content": content,
         "image_url": image_url,
         "metadata": meta,
+        "style": style if style in VALID_LOG_STYLES else DEFAULT_LOG_STYLE,
     }
     result = sb.table("nodes").insert(row).execute()
     node = result.data[0]
